@@ -14,8 +14,6 @@ class ReservePage extends StatefulWidget {
 
 class _ReservePageState extends State<ReservePage> {
   bool _isEditMode = false;
-
-  // パスワードを直書きせず、Firestoreから取得した値を保持する
   String _fetchedAdminPass = "";
 
   final TextEditingController _nameCtrl = TextEditingController();
@@ -31,10 +29,9 @@ class _ReservePageState extends State<ReservePage> {
     super.initState();
     _listenToReservations();
     _loadCalendarData();
-    _loadAdminSettings(); // 管理者設定を読み込む
+    _loadAdminSettings();
   }
 
-  // --- 管理者設定（パスワード等）をFirestoreから取得 ---
   Future<void> _loadAdminSettings() async {
     try {
       DocumentSnapshot settings = await _firestore.collection('settings').doc('admin').get();
@@ -76,7 +73,6 @@ class _ReservePageState extends State<ReservePage> {
     return true;
   }
 
-  // --- リアルタイム監視 ---
   void _listenToReservations() {
     _firestore
         .collection('reservations')
@@ -86,6 +82,9 @@ class _ReservePageState extends State<ReservePage> {
       final List<Map<String, dynamic>> fetched = snapshot.docs.map((doc) {
         final data = doc.data();
         data['id'] = doc.id;
+        if (data['timestamp'] is Timestamp) {
+          data['timestamp'] = (data['timestamp'] as Timestamp).millisecondsSinceEpoch;
+        }
         return data;
       }).toList();
 
@@ -93,17 +92,29 @@ class _ReservePageState extends State<ReservePage> {
         setState(() {
           _reservations = fetched;
         });
-        // 変更があったらバッジ用データを保存
         _saveToLocalForBadge(fetched);
       }
     });
   }
 
-  // 引数で受け取ったリストを確実に保存する
   Future<void> _saveToLocalForBadge(List<Map<String, dynamic>> dataList) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('ragnoise_reserve_data', jsonEncode(dataList));
-    debugPrint("Badge data saved: ${dataList.length} items");
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final List<Map<String, dynamic>> cleanList = dataList.map((item) {
+        return {
+          'id': item['id'],
+          'isConfirmed': item['isConfirmed'] ?? false,
+          'name': item['name'] ?? '',
+          'date': item['date'] ?? '',
+          'time': item['time'] ?? '',
+        };
+      }).toList();
+
+      await prefs.setString('ragnoise_reserve_data', jsonEncode(cleanList));
+      debugPrint("Badge Update: ${cleanList.where((e) => e['isConfirmed'] == false).length} items");
+    } catch (e) {
+      debugPrint("Save Error: $e");
+    }
   }
 
   Future<void> _submitReservation() async {
@@ -120,42 +131,45 @@ class _ReservePageState extends State<ReservePage> {
     try {
       await _firestore.collection('reservations').add(newReserve);
 
-      showDialog(
-        context: context,
-        builder: (context) => AlertDialog(
-          backgroundColor: Colors.black,
-          shape: RoundedRectangleBorder(side: const BorderSide(color: Color(0xFFD4AF37)), borderRadius: BorderRadius.circular(15)),
-          title: const Text('REQUEST SENT', style: TextStyle(color: Color(0xFFD4AF37), fontSize: 14, letterSpacing: 2)),
-          content: const Text('仮予約を承りました。店舗からの連絡をお待ちください。', style: TextStyle(color: Colors.white70, fontSize: 12)),
-          actions: [
-            TextButton(onPressed: () {
-              Navigator.pop(context);
-              _nameCtrl.clear();
-            }, child: const Text('OK', style: TextStyle(color: Color(0xFFD4AF37)))),
-          ],
-        ),
-      );
+      if (mounted) {
+        showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            backgroundColor: Colors.black,
+            shape: RoundedRectangleBorder(side: const BorderSide(color: Color(0xFFD4AF37)), borderRadius: BorderRadius.circular(15)),
+            title: const Text('送信完了', style: TextStyle(color: Color(0xFFD4AF37), fontSize: 14, letterSpacing: 2)),
+            content: const Text('仮予約を承りました。店舗からの連絡をお待ちください。', style: TextStyle(color: Colors.white70, fontSize: 12)),
+            actions: [
+              TextButton(onPressed: () {
+                Navigator.pop(context);
+                _nameCtrl.clear();
+              }, child: const Text('OK', style: TextStyle(color: Color(0xFFD4AF37)))),
+            ],
+          ),
+        );
+      }
     } catch (e) {
       debugPrint("Submit Error: $e");
     }
   }
 
-  // --- 承認切り替え（即時反映対応） ---
   Future<void> _toggleConfirm(String id, bool currentStatus) async {
-    // 1. Firestoreを更新
-    await _firestore.collection('reservations').doc(id).update({
-      'isConfirmed': !currentStatus,
-    });
+    try {
+      await _firestore.collection('reservations').doc(id).update({
+        'isConfirmed': !currentStatus,
+      });
 
-    // 2. ローカル上のリストを即座に作成して保存（バッジのラグ解消）
-    final updatedList = _reservations.map((res) {
-      if (res['id'] == id) {
-        return {...res, 'isConfirmed': !currentStatus};
-      }
-      return res;
-    }).toList();
+      final updatedList = _reservations.map((res) {
+        if (res['id'] == id) {
+          return {...res, 'isConfirmed': !currentStatus};
+        }
+        return res;
+      }).toList();
+      await _saveToLocalForBadge(updatedList);
 
-    await _saveToLocalForBadge(updatedList);
+    } catch (e) {
+      debugPrint("Update Error: $e");
+    }
   }
 
   void _showPassDialog() {
@@ -165,25 +179,28 @@ class _ReservePageState extends State<ReservePage> {
       builder: (context) => AlertDialog(
         backgroundColor: const Color(0xFF1A1A1A),
         shape: RoundedRectangleBorder(side: const BorderSide(color: Color(0xFFD4AF37), width: 0.5), borderRadius: BorderRadius.circular(15)),
-        title: const Text('ADMIN ACCESS', style: TextStyle(color: Color(0xFFD4AF37), fontSize: 12, letterSpacing: 2)),
+        title: const Text('管理者認証', style: TextStyle(color: Color(0xFFD4AF37), fontSize: 12, letterSpacing: 2)),
         content: TextField(
           controller: passCtrl,
           obscureText: true,
           style: const TextStyle(color: Colors.white),
-          decoration: const InputDecoration(enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Color(0xFFD4AF37)))),
+          decoration: const InputDecoration(
+              hintText: "パスワードを入力",
+              hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
+              enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Color(0xFFD4AF37)))
+          ),
         ),
         actions: [
           TextButton(onPressed: () {
-            // Firestoreから取得した最新のパスワードと比較
             if (_fetchedAdminPass.isNotEmpty && passCtrl.text == _fetchedAdminPass) {
               setState(() => _isEditMode = true);
               Navigator.pop(context);
             } else {
               ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text("Invalid Password"), backgroundColor: Colors.redAccent),
+                const SnackBar(content: Text("パスワードが正しくありません"), backgroundColor: Colors.redAccent),
               );
             }
-          }, child: const Text('UNLOCK', style: TextStyle(color: Color(0xFFD4AF37)))),
+          }, child: const Text('ロック解除', style: TextStyle(color: Color(0xFFD4AF37)))),
         ],
       ),
     );
@@ -234,12 +251,12 @@ class _ReservePageState extends State<ReservePage> {
     return ListView(
       padding: const EdgeInsets.all(20),
       children: [
-        const Text('RESERVATION MANAGEMENT', style: TextStyle(color: Color(0xFFD4AF37), fontSize: 10, letterSpacing: 2)),
+        const Text('予約管理モード', style: TextStyle(color: Color(0xFFD4AF37), fontSize: 10, letterSpacing: 2)),
         const SizedBox(height: 20),
         if (_reservations.isEmpty)
           const Padding(
             padding: EdgeInsets.symmetric(vertical: 40),
-            child: Center(child: Text("No data found.", style: TextStyle(color: Colors.white24, fontSize: 12))),
+            child: Center(child: Text("予約データがありません", style: TextStyle(color: Colors.white24, fontSize: 12))),
           )
         else
           ..._reservations.map((res) => _buildAdminReserveCard(res)),
@@ -264,7 +281,7 @@ class _ReservePageState extends State<ReservePage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(data['name'] ?? 'Unknown', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                Text(data['name'] ?? '名前不明', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                 Text("${data['date']} ${data['time']}", style: const TextStyle(color: Colors.white54, fontSize: 12)),
               ],
             ),
@@ -272,7 +289,7 @@ class _ReservePageState extends State<ReservePage> {
           TextButton(
             onPressed: () => _toggleConfirm(docId, isConfirmed),
             child: Text(
-              isConfirmed ? 'UNDO' : 'CONFIRM',
+              isConfirmed ? '未対応に戻す' : '承認する',
               style: TextStyle(color: isConfirmed ? Colors.white38 : const Color(0xFFD4AF37), fontSize: 12),
             ),
           ),
@@ -288,21 +305,21 @@ class _ReservePageState extends State<ReservePage> {
         const SizedBox(height: 20),
         const Icon(Icons.auto_awesome, color: Color(0xFFD4AF37), size: 40),
         const SizedBox(height: 20),
-        const Center(child: Text('RESERVATION REQUEST', style: TextStyle(color: Colors.white, fontSize: 18, letterSpacing: 4))),
+        const Center(child: Text('予約リクエスト', style: TextStyle(color: Colors.white, fontSize: 18, letterSpacing: 4))),
         const SizedBox(height: 10),
         const Text('※お席を確定するものではありません。\n店舗より折り返しご連絡差し上げます。',
             textAlign: TextAlign.center, style: TextStyle(color: Colors.white38, fontSize: 11, height: 1.5)),
         const SizedBox(height: 40),
 
-        _buildInputLabel("NAME"),
+        _buildInputLabel("お名前"),
         TextField(
           controller: _nameCtrl,
           style: const TextStyle(color: Colors.white),
-          decoration: _inputDecoration("Enter your name"),
+          decoration: _inputDecoration("お名前を入力してください"),
         ),
         const SizedBox(height: 25),
 
-        _buildInputLabel("DATE"),
+        _buildInputLabel("ご希望日"),
         GestureDetector(
           onTap: () async {
             final picked = await showDatePicker(
@@ -331,7 +348,7 @@ class _ReservePageState extends State<ReservePage> {
         ),
         const SizedBox(height: 25),
 
-        _buildInputLabel("TIME"),
+        _buildInputLabel("ご希望時間"),
         DropdownButtonFormField<String>(
           value: _selectedTime,
           dropdownColor: const Color(0xFF1A1A1A),
@@ -353,18 +370,18 @@ class _ReservePageState extends State<ReservePage> {
                 backgroundColor: const Color(0xFFD4AF37),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
             ),
-            child: const Text('SEND REQUEST', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, letterSpacing: 2)),
+            child: const Text('リクエストを送信', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, letterSpacing: 2)),
           ),
         ),
 
         const SizedBox(height: 60),
-        const Text('RECENT REQUESTS', style: TextStyle(color: Color(0xFFD4AF37), fontSize: 10, letterSpacing: 2)),
+        const Text('最近のリクエスト', style: TextStyle(color: Color(0xFFD4AF37), fontSize: 10, letterSpacing: 2)),
         const SizedBox(height: 15),
 
         if (_reservations.isEmpty)
           const Padding(
             padding: EdgeInsets.symmetric(vertical: 20),
-            child: Text("No requests found.", style: TextStyle(color: Colors.white24, fontSize: 12)),
+            child: Text("リクエスト履歴はありません", style: TextStyle(color: Colors.white24, fontSize: 12)),
           )
         else
           ..._reservations.take(5).map((res) => _buildUserReserveListItem(res)),
@@ -400,7 +417,7 @@ class _ReservePageState extends State<ReservePage> {
               color: isConfirmed ? Colors.green.withAlpha(40) : const Color(0xFFD4AF37).withAlpha(40),
             ),
             child: Text(
-              isConfirmed ? "CONFIRMED" : "PENDING",
+              isConfirmed ? "承認済み" : "確認中",
               style: TextStyle(
                 color: isConfirmed ? Colors.green : const Color(0xFFD4AF37),
                 fontSize: 9,
